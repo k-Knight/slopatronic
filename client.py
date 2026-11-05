@@ -30,7 +30,7 @@ def _spawn_detached():
     else:
         kwargs["start_new_session"] = True
     return subprocess.Popen(
-        [sys.executable, "-c", "from music_cli.daemon import serve; serve()"],
+        [sys.executable, "-c", "from slopatronic.daemon import serve; serve()"],
         cwd=PACKAGE_PARENT,
         **kwargs,
     )

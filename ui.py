@@ -1,4 +1,4 @@
-"""Textual TUI for music_cli — vim style, clickable, with live filtering.
+"""Textual TUI for slopatronic — vim style, clickable, with live filtering.
 
 Vim flow:
   :  or i   open the command line (find / add / play / pause / …)
@@ -159,7 +159,7 @@ def meter_rows(meter):
 
 
 def queue_table(st):
-    """Rich table of the queue for the plain terminal (`music_cli queue`)."""
+    """Rich table of the queue for the plain terminal (`slopatronic queue`)."""
     table = Table(title="Queue")
     table.add_column("", width=2)
     table.add_column("#", justify="right", style="dim")
@@ -205,7 +205,7 @@ class ClickableTable(DataTable):
 
 
 class MusicTUI(App):
-    TITLE = f"{ICON_MUSIC} music_cli"
+    TITLE = f"{ICON_MUSIC} slopatronic"
     SUB_TITLE = "youtube finder + background player"
     AUTO_FOCUS = None  # start with the lists in control; ':' focuses the command line
     ENABLE_COMMAND_PALETTE = False  # no ctrl+p palette — the command line is the bar

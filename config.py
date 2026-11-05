@@ -19,5 +19,5 @@ METER_BANDS = 24
 METER_FULL_SCALE = 12000
 BAR_CHARS = "▁▂▃▄▅▆▇█"
 
-# Folder that contains the music_cli package, used to start the player in the background.
+# Folder that contains the slopatronic package, used to start the player in the background.
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
