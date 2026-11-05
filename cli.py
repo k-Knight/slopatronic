@@ -1,7 +1,6 @@
 import argparse
 import time
 
-import questionary
 from rich.table import Table
 
 from .client import ensure_daemon, request
@@ -17,17 +16,12 @@ def pick_youtube(query):
     if not results:
         console.print("[red]No results.[/]")
         return []
-    picked = questionary.checkbox(
-        "Tick tracks with space, then Enter to download:",
-        choices=[questionary.Choice(e.get("title", "untitled"), value=i) for i, e in enumerate(results)],
-        use_search_filter=True,
-        use_jk_keys=False,
-    ).ask()
-    if picked is None:
-        return []
-    if not picked:
-        console.print("[dim]Nothing ticked. Press space on a track to tick it, then Enter.[/]")
-    return [results[i] for i in picked]
+    # the TUI is the picker; run it and let the user download from the Search tab
+    console.print(f"[green]{len(results)} results:[/]")
+    for i, entry in enumerate(results, 1):
+        console.print(f"  {i:2d}. {entry.get('title', 'untitled')}")
+    console.print("[dim]Tip: run `ui` and use `find` there to download inside the TUI.[/]")
+    return []
 
 
 def fetch(entry):
@@ -44,7 +38,7 @@ def fetch(entry):
 
 
 def pick_library_track(query):
-    """Resolve a query to one library track: a number, a fuzzy match, or a pick from several."""
+    """Resolve a query to one library track: a number, a fuzzy match, or the best hit."""
     files = library_files()
     if not files:
         console.print("[dim]Library is empty. Use find first.[/]")
@@ -55,14 +49,7 @@ def pick_library_track(query):
     if not candidates:
         console.print(f"[red]No library match for '{query}'.[/] Try: find {query}")
         return None
-    if len(candidates) == 1:
-        return candidates[0]
-    return questionary.select(
-        "Pick a track:",
-        choices=[questionary.Choice(p.stem, value=p) for p in candidates],
-        use_search_filter=True,
-        use_jk_keys=False,
-    ).ask()
+    return candidates[0]  # best fuzzy hit
 
 
 def cmd_find(args):
@@ -116,7 +103,6 @@ def cmd_queue(_args):
 
 
 def cmd_ui(_args):
-    ensure_daemon()
     run_ui()
 
 
@@ -147,7 +133,7 @@ def main():
         "play": (cmd_play, "play a library track now, replacing the current one", "*"),
         "list": (cmd_list, "list downloaded tracks", None),
         "queue": (cmd_queue, "show the current queue", None),
-        "ui": (cmd_ui, "show the player panel with keyboard controls", None),
+        "ui": (cmd_ui, "full TUI: search, download, queue and player controls", None),
         "pause": (control("pause"), "pause or resume", None),
         "next": (control("next"), "skip to the next track", None),
         "prev": (control("prev"), "go back to the previous track", None),

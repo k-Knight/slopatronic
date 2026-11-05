@@ -1,10 +1,11 @@
 import subprocess
+import sys
 from array import array
 
 import imageio_ffmpeg
 import miniaudio
 
-from .config import BAR_CHARS, CHANNELS, FRAMES_PER_SECOND, METER_BANDS, METER_FULL_SCALE, SAMPLE_RATE
+from .config import CHANNELS, FRAMES_PER_SECOND, METER_BANDS, METER_FULL_SCALE, SAMPLE_RATE
 
 FORMAT = miniaudio.SampleFormat.SIGNED16
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
@@ -12,12 +13,12 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 def decode(path):
     """Decode any audio file to 16-bit stereo PCM at SAMPLE_RATE, using the bundled ffmpeg."""
-    result = subprocess.run(
-        [FFMPEG, "-v", "error", "-i", str(path), "-vn",
-         "-f", "s16le", "-acodec", "pcm_s16le", "-ac", str(CHANNELS), "-ar", str(SAMPLE_RATE), "-"],
-        capture_output=True,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+    cmd = [FFMPEG, "-v", "error", "-i", str(path), "-vn",
+           "-f", "s16le", "-acodec", "pcm_s16le", "-ac", str(CHANNELS), "-ar", str(SAMPLE_RATE), "-"]
+    if sys.platform == "win32":
+        result = subprocess.run(cmd, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    else:
+        result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="replace").strip() or "ffmpeg could not decode the file")
     samples = array("h")
@@ -102,18 +103,17 @@ class Player:
         return self.pos >= len(self.samples)
 
     def meter(self):
-        """Loudness per band for the next few frames, as block characters."""
+        """Loudness per band for the next few frames, as 0..1 ratios."""
         if not self.loaded or self.paused:
-            return BAR_CHARS[0] * METER_BANDS
+            return [0.0] * METER_BANDS
         window = self.samples[self.pos:self.pos + 4096]
         band = max(1, len(window) // METER_BANDS)
-        bars = ""
+        ratios = []
         for i in range(METER_BANDS):
             chunk = window[i * band:(i + 1) * band]
             level = sum(abs(s) for s in chunk) / band if chunk else 0
-            ratio = min(1.0, level / METER_FULL_SCALE)
-            bars += BAR_CHARS[min(len(BAR_CHARS) - 1, int(ratio * len(BAR_CHARS)))]
-        return bars
+            ratios.append(round(min(1.0, level / METER_FULL_SCALE), 2))
+        return ratios
 
     def close(self):
         self.stop()

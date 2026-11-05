@@ -62,6 +62,22 @@ class Daemon:
                     self._load_current()
                 else:
                     self.queue.extend(paths)
+            elif cmd == "remove":
+                # drop one queued track; removing the currently playing one
+                # skips straight to the track that takes its slot
+                idx = int(req["index"])
+                if not (0 <= idx < len(self.queue)):
+                    return {"error": "no such queue index"}
+                self.queue.pop(idx)
+                if idx < self.index:
+                    self.index -= 1
+                elif idx == self.index:
+                    if not self.queue:
+                        self._go_idle()
+                    elif self.player.loaded:
+                        self._load_current()  # play the new occupant of the slot
+                elif self.index >= len(self.queue):
+                    self.index = max(0, len(self.queue) - 1)
             elif cmd == "play":
                 # playskip: the chosen track replaces the current one and starts now.
                 path = Path(req["path"])
