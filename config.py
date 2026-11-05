@@ -3,6 +3,10 @@ from pathlib import Path
 LIBRARY = Path.home() / "my_py_music"
 EXTENSIONS = {".m4a", ".webm", ".opus", ".mp3", ".ogg", ".wav", ".flac"}
 
+# Extra folders the library also reads from, persisted as JSON:
+# [{"path": "/abs/dir", "recursive": false}, ...]
+DIRS_FILE = LIBRARY / "folders.json"
+
 # The background player listens on this local port.
 HOST = "127.0.0.1"
 PORT = 47651

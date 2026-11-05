@@ -1,11 +1,10 @@
 import argparse
 import time
 
-from rich.table import Table
 
 from .client import ensure_daemon, request
 from .downloader import download, search
-from .library import fuzzy_paths, library_files
+from .library import fuzzy_paths, library_files, library_tree
 from .ui import console, queue_table, run_ui
 
 
@@ -82,16 +81,18 @@ def cmd_play(args):
 
 
 def cmd_list(_args):
-    files = library_files()
+    # same tree the TUI Library tab shows: folder roots, subfolders, tracks
+    rows = library_tree()
+    files = [p for kind, _d, _n, p in rows if kind == "file"]
     if not files:
         console.print("[dim]No music yet. Use find first.[/]")
         return
-    table = Table(title=str(files[0].parent))
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("Track")
-    for i, path in enumerate(files, 1):
-        table.add_row(str(i), path.stem)
-    console.print(table)
+    numbers = iter(range(1, len(files) + 1))
+    for kind, depth, name, path in rows:
+        if kind == "dir":
+            console.print(f"{'  ' * depth}[bold]{name}/[/]")
+        else:
+            console.print(f"{'  ' * depth}[dim]{next(numbers):>3d}.[/] {name}")
 
 
 def cmd_queue(_args):

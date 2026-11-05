@@ -35,10 +35,13 @@ from textual.widgets import (
     TabPane,
 )
 
+from pathlib import Path
+
 from .client import ensure_daemon, request
-from .config import BAR_CHARS
+from .config import BAR_CHARS, LIBRARY
 from .downloader import download, search
-from .library import fuzzy_paths, library_files
+from .folders import add_folder, folders, is_managed, remove_folder, set_recursive
+from .library import dir_file_counts, fuzzy_paths, library_files, library_tree
 
 console = Console()
 
@@ -66,6 +69,7 @@ ICON_MUSIC = "\uf001"     # nf-fa-music
 ICON_SEARCH = "\uf002"    # nf-fa-search
 ICON_QUEUE = "\uf0cb"     # nf-fa-list-ol
 ICON_LIBRARY = "\uf02d"   # nf-fa-book
+ICON_FOLDER = "\uf07b"   # nf-fa-folder
 ICON_HELP = "\uf059"      # nf-fa-question_circle
 ICON_VOL_UP = "\uf028"    # nf-fa-volume_up
 ICON_VOL_DOWN = "\uf027"  # nf-fa-volume_down
@@ -91,16 +95,22 @@ press Esc any time to hand control back to the lists
   [b]space[/]       pause or resume
   [b]n[/] / [b]b[/]       next / previous track
   [b]d[/]          download highlighted search result / remove the
-                   highlighted track from the queue
+                   highlighted track from the queue / delete a library
+                   file (managed folder only, press twice) / unregister
+                   a highlighted extra folder
   [b]a[/]          add highlighted library track to the queue
-  [b]Enter[/]       add to queue (Library) or download (Search) the row
+  [b]j[/] / [b]k[/]      on a Library folder row: moving down onto it
+                   expands it, moving up onto it collapses it
+  [b]Enter[/]       add to queue (Library) or download (Search) the row;
+                   on a folder row (Library/Folders) it collapses or
+                   expands the folder / toggles its recursive flag
+  [b]Mouse[/]: click a Library folder row to collapse/expand it, click a
+                  file row to add it to the queue, click a Search row
+                  to download it, click the transport buttons on Now Playing,
+                  click a tab header to switch.
   [b]r[/]          refresh the library
   [b]s[/]          stop the player
   [b]q[/]          quit the TUI (music keeps playing)
-
-[bold]Mouse[/]: click a Library row to add it to the queue, click a Search row
-to download it, click the transport buttons on Now Playing,
-click a tab header to switch.
 
 [bold]Commands[/]
   [cyan]find <query>[/]     search YouTube; results land in the Search tab
@@ -112,6 +122,10 @@ click a tab header to switch.
   [cyan]seek <seconds>[/]   jump to a position (negative goes back)
   [cyan]vol <0-100>[/]      set the volume directly
   [cyan]stop[/]             stop the background player and clear the queue
+  [cyan]folders[/]          open the Folders tab (extra library folders)
+  [cyan]folder add <path> [-r][/]  register an extra folder (-r = recursive)
+  [cyan]folder rm <n|path>[/]      unregister an extra folder (files kept)
+  [cyan]folder recursive <n|path>[/]  toggle recursive lookup
   [cyan]help[/]             show this help
 """
 
@@ -167,7 +181,7 @@ class ClickableTable(DataTable):
         # Replace DataTable's default click handling entirely: the stock one
         # only posts RowSelected when you re-click the highlighted row, which
         # made one click trigger two different actions.
-        if self.id not in ("libraryview", "results") or not self.row_count:
+        if self.id not in ("libraryview", "results", "dirsview") or not self.row_count:
             super()._on_click(event)
             return
         event.stop()
@@ -178,9 +192,16 @@ class ClickableTable(DataTable):
         self.cursor_coordinate = Coordinate(row, 0)
         self._scroll_cursor_into_view(animate=False)
         if self.id == "libraryview":
-            self.app.action_add()       # click = add to queue (Enter still plays)
+            # a folder row toggles collapse, a file row is added to the queue
+            rows = self.app.shown_library_rows
+            if 0 <= row < len(rows) and rows[row][0] == "dir":
+                self.app.toggle_collapse_row(row)
+            else:
+                self.app.action_add()       # click = add to queue (Enter still plays)
         elif self.id == "results":
             self.app.download_row()
+        elif self.id == "dirsview":
+            self.app.toggle_recursive_row()  # click a folder row = tick/untick it
 
 
 class MusicTUI(App):
@@ -247,7 +268,15 @@ class MusicTUI(App):
         self.search_results = []       # every result of the last find
         self.shown_results = []        # results visible after filtering
         self.library_paths = []        # every library track
+        self.shown_library_rows = []   # tree rows visible after filtering
         self.shown_library = []        # library rows visible after filtering
+        self.folder_rows = []          # Folders tab rows as folders() dicts
+        self._expanded_dirs = None     # per-session expanded dirs (never saved)
+        self._tree_rows = []           # full tree, rebuilt only on refresh
+        self._tree_counts = {}         # dir path -> files anywhere beneath
+        self._library_index = {}       # file path -> number in the full library
+        self._pending_delete = None    # path awaiting the second 'd' press
+        self._pending_delete_at = 0.0  # when that press happened
         self._meter_prev = None        # last band ratios, for decay smoothing
         self._meter_queue = deque()    # (timestamp, ratios) frames for the delay line
         self._was_offline = False      # poll slowly until the daemon answers again
@@ -284,6 +313,8 @@ class MusicTUI(App):
                 yield ClickableTable(id="queueview")
             with TabPane(f"{ICON_LIBRARY} Library", id="library"):
                 yield ClickableTable(id="libraryview")
+            with TabPane(f"{ICON_FOLDER} Folders", id="folders"):
+                yield ClickableTable(id="dirsview")
             with TabPane(f"{ICON_HELP} Help", id="help"):
                 yield Static(HELP_TEXT)
         yield Input(placeholder=": command   / filter", id="command")
@@ -295,13 +326,17 @@ class MusicTUI(App):
         queue.add_columns("", "#", "Track")
         library = self.query_one("#libraryview", DataTable)
         library.add_columns("#", "Track")
-        for table in (results, queue, library):
+        dirs = self.query_one("#dirsview", DataTable)
+        dirs.add_columns("Recursive", "Folder", "Files")
+        for table in (results, queue, library, dirs):
             table.cursor_type = "row"
 
         # poll fast while playing (smooth meter), slowly when idle/stopped
         self._poll = self.set_interval(POLL_SECONDS, self.refresh_status)
+        self._expanded_dirs = {LIBRARY.resolve()}  # base expanded, extras not
         self.refresh_status()
         self.refresh_library()
+        self.refresh_folders()
 
     # ----- command line open / close --------------------------------------
 
@@ -461,18 +496,181 @@ class MusicTUI(App):
 
     def refresh_library(self):
         self.library_paths = library_files()
+        self._tree_rows = library_tree(self.library_paths)
+        self._tree_counts = dir_file_counts(self.library_paths)
+        self._library_index = {str(p): i for i, p in enumerate(self.library_paths)}
         self.render_library(self.filter_query())
+
+    def refresh_folders(self):
+        """Rebuild the Folders tab: managed folder first, then extras."""
+        table = self.query_one("#dirsview", DataTable)
+        table.clear()
+        self.folder_rows = folders()
+        for entry in self.folder_rows:
+            root = Path(entry["path"])
+            count = self._tree_counts.get(str(root), 0)
+            if entry["managed"]:
+                mark, style = "[dim]☑[/]", "dim"  # managed is always recursive
+            elif entry["recursive"]:
+                mark, style = "[green]☑[/]", ""
+            else:
+                mark, style = "☐", ""
+            label = f"[{style}]{root}[/]" if style else str(root)
+            table.add_row(mark, label, str(count))
+
+    # ----- folders management ---------------------------------------------
+
+    def toggle_recursive_row(self):
+        """Tick/untick recursive lookup for the highlighted folder (Enter/click)."""
+        table = self.query_one("#dirsview", DataTable)
+        if not self.folder_rows or not (0 <= table.cursor_row < len(self.folder_rows)):
+            return
+        entry = self.folder_rows[table.cursor_row]
+        if entry["managed"]:
+            self.notify("the default folder is always scanned recursively", severity="warning")
+            return
+        try:
+            new = set_recursive(entry["path"], not entry["recursive"])
+        except KeyError:
+            self.refresh_folders()
+            return
+        self.notify(f"recursive {'on' if new else 'off'}: {entry['path']}")
+        self.refresh_library()  # rescan first, so the Files column is fresh
+        self.refresh_folders()
+
+    def remove_folder_row(self):
+        """d on the Folders tab: unregister the highlighted extra folder."""
+        table = self.query_one("#dirsview", DataTable)
+        if not self.folder_rows or not (0 <= table.cursor_row < len(self.folder_rows)):
+            return
+        entry = self.folder_rows[table.cursor_row]
+        if entry["managed"]:
+            self.notify("the default folder cannot be removed", severity="warning")
+            return
+        if remove_folder(entry["path"]) is not None:
+            self.notify(f"folder removed (files kept): {entry['path']}")
+        self.refresh_library()
+        self.refresh_folders()
 
     def filter_query(self):
         value = self.query_one("#command", Input).value
         return value[1:].strip().lower() if value.startswith("/") else ""
 
+    def _visible_tree_rows(self, rows):
+        """Rows visible under the per-session collapse state: an expanded
+        directory shows its direct children (subdirectories stay collapsed
+        until expanded themselves); a collapsed one shows just itself."""
+        expanded = self._expanded_dirs or set()
+        visible = []
+        skip_depth = None  # inside a collapsed dir: hide deeper rows
+        for kind, depth, name, path in rows:
+            if skip_depth is not None:
+                if depth > skip_depth:
+                    continue
+                skip_depth = None
+            visible.append((kind, depth, name, path))
+            if kind == "dir" and path not in expanded:
+                skip_depth = depth
+        return visible
+
+    def _filtered_tree_rows(self, query):
+        """Prune the cached full tree to matching files plus their parent
+        directories — O(rows) per keystroke, no rescan, no syscalls."""
+        keep_files, keep_dirs = set(), set()
+        for kind, _depth, _name, path in self._tree_rows:
+            if kind == "file" and query in path.stem.lower():
+                keep_files.add(str(path))
+                keep_dirs.update(str(p) for p in path.parents)
+        return [row for row in self._tree_rows
+                if (row[0] == "file" and str(row[3]) in keep_files)
+                or (row[0] == "dir" and str(row[3]) in keep_dirs)]
+
     def render_library(self, query=""):
+        """Render the library as a tree from the cached rows: folder roots,
+        subfolders (recursive folders only) and indented tracks.
+        Subdirectories start collapsed; collapsed rows show their file count.
+        While filtering, everything is shown expanded (isolated view).
+        Track numbers match the full unfiltered library order."""
         table = self.query_one("#libraryview", DataTable)
         table.clear()
-        self.shown_library = [p for p in self.library_paths if query in p.stem.lower()]
-        for i, path in enumerate(self.shown_library, 1):
-            table.add_row(str(i), path.stem)
+        rows = (self._filtered_tree_rows(query) if query
+                else self._visible_tree_rows(self._tree_rows))
+        self.shown_library_rows = rows
+        self.shown_library = [path for kind, _depth, _name, path in rows if kind == "file"]
+        expanded = self._expanded_dirs or set()
+        for kind, depth, name, path in rows:
+            if kind == "dir":
+                if query or path in expanded:  # filtered view: all expanded
+                    table.add_row("", f"{'  ' * depth}▾ {ICON_FOLDER} [dim]{name}/[/]")
+                else:
+                    count = self._tree_counts.get(str(path), 0)
+                    table.add_row("", f"{'  ' * depth}▸ {ICON_FOLDER} [dim]{name}/ ({count})[/]")
+            else:
+                index = self._library_index.get(str(path))
+                table.add_row(str(index + 1) if index is not None else "",
+                              f"{'  ' * depth}{name}")
+
+    def _set_dir_expanded(self, path, value):
+        """Change the per-session collapse state of a directory and re-render.
+        Returns True if anything changed. Never touches folders.json."""
+        if self._expanded_dirs is None:
+            return False
+        value = bool(value)
+        if (path in self._expanded_dirs) == value:
+            return False
+        if value:
+            self._expanded_dirs.add(path)
+        else:
+            self._expanded_dirs.discard(path)
+        table = self.query_one("#libraryview", DataTable)
+        # clear() inside render_library resets the scroll to the top —
+        # remember where the user is looking (e.g. after mouse scrolling)
+        # and put the view back afterwards.
+        scroll_x, scroll_y = table.scroll_offset.x, table.scroll_offset.y
+        self.render_library(self.filter_query())
+        # keep the cursor on the folder row that was just toggled
+        for i, row in enumerate(self.shown_library_rows):
+            if row[0] == "dir" and row[3] == path:
+                table.cursor_coordinate = (i, 0)
+                break
+        table.scroll_to(x=scroll_x, y=scroll_y, animate=False)
+        return True
+
+    def toggle_collapse_row(self, row=None):
+        """Collapse/expand the highlighted (or given) directory row."""
+        table = self.query_one("#libraryview", DataTable)
+        if row is None:
+            row = table.cursor_row
+        if not (0 <= row < len(self.shown_library_rows)):
+            return
+        kind, _depth, _name, path = self.shown_library_rows[row]
+        if kind != "dir":
+            return
+        if self.filter_query():
+            return  # filtered view is isolated: nothing to collapse
+        self._set_dir_expanded(path, path not in (self._expanded_dirs or set()))
+
+    def _auto_dir_nav(self, expand):
+        """After j/k moved the cursor: expand the folder we move down onto,
+        collapse the one we move up onto. In the filtered (fully expanded)
+        view nothing changes — that state is isolated."""
+        if self.filter_query():
+            return
+        row = self.library_cursor_row()
+        if row and row[0] == "dir":
+            self._set_dir_expanded(row[3], expand)
+
+    def library_cursor_path(self):
+        """Path of the highlighted Library row, or None on folder rows."""
+        row = self.library_cursor_row()
+        return row[3] if row and row[0] == "file" else None
+
+    def library_cursor_row(self):
+        """The highlighted Library tree row, or None."""
+        table = self.query_one("#libraryview", DataTable)
+        if 0 <= table.cursor_row < len(self.shown_library_rows):
+            return self.shown_library_rows[table.cursor_row]
+        return None
 
     def render_results(self, query=""):
         table = self.query_one("#results", DataTable)
@@ -595,6 +793,11 @@ class MusicTUI(App):
         elif cmd == "list":
             self.refresh_library()
             self.query_one(TabbedContent).active = "library"
+        elif cmd in ("folders", "dirs"):
+            self.refresh_folders()
+            self.query_one(TabbedContent).active = "folders"
+        elif cmd == "folder":
+            self.run_folder_command(raw)
         elif cmd == "queue":
             self.refresh_status()
             self.query_one(TabbedContent).active = "queue"
@@ -621,6 +824,71 @@ class MusicTUI(App):
         else:
             self.notify(f"unknown command '{cmd}' — type help", severity="error")
 
+    def run_folder_command(self, raw):
+        """folder add <path> [-r] | folder rm <n|path> | folder recursive <n|path>"""
+        parts = raw.split()
+        if len(parts) < 2:
+            self.notify("usage: folder add <path> [-r] | folder rm <n|path> | "
+                        "folder recursive <n|path>", severity="warning")
+            return
+        sub = parts[1].lower()
+        if sub == "add":
+            rest = parts[2:]
+            if not rest:
+                self.notify("usage: folder add <path> [-r]", severity="warning")
+                return
+            recursive = rest[-1].lower() in ("-r", "recursive")
+            if recursive:
+                rest = rest[:-1]
+            try:
+                added = add_folder(" ".join(rest), recursive)
+            except (FileNotFoundError, ValueError) as exc:
+                self.notify(str(exc), severity="error")
+                return
+            self.notify(f"folder added: {added}")
+            self.refresh_library()
+            self.refresh_folders()
+            self.query_one(TabbedContent).active = "folders"
+            return
+        if sub in ("rm", "remove", "recursive"):
+            entry = self._resolve_folder(" ".join(parts[2:]))
+            if entry is None:
+                return
+            if sub == "recursive":
+                if entry["managed"]:
+                    self.notify("the default folder is always scanned (top level)",
+                                severity="warning")
+                    return
+                new = set_recursive(entry["path"], not entry["recursive"])
+                self.notify(f"recursive {'on' if new else 'off'}: {entry['path']}")
+            else:
+                if entry["managed"]:
+                    self.notify("the default folder cannot be removed", severity="warning")
+                    return
+                remove_folder(entry["path"])
+                self.notify(f"folder removed (files kept): {entry['path']}")
+            self.refresh_library()
+            self.refresh_folders()
+            return
+        self.notify(f"unknown folder subcommand '{sub}' — add / rm / recursive",
+                    severity="error")
+
+    def _resolve_folder(self, arg):
+        """A Folders-tab row by number (row order) or path prefix/substring."""
+        rows = folders()
+        if not rows:
+            self.notify("no folders registered", severity="warning")
+            return None
+        if arg.isdigit() and 1 <= int(arg) <= len(rows):
+            return rows[int(arg) - 1]
+        needle = arg.lower().rstrip("/")
+        hits = [r for r in rows if needle in r["path"].lower()]
+        if len(hits) != 1:
+            self.notify(f"no unique folder match for '{arg}' — use its row number",
+                        severity="error")
+            return None
+        return hits[0]
+
     def resolve_library(self, query):
         """Resolve a query to one library path, or None with a notice."""
         if not self.library_paths:
@@ -639,7 +907,8 @@ class MusicTUI(App):
 
     # ----- focus management -----------------------------------------------
 
-    TABLE_BY_TAB = {"search": "#results", "queue": "#queueview", "library": "#libraryview"}
+    TABLE_BY_TAB = {"search": "#results", "queue": "#queueview", "library": "#libraryview",
+                    "folders": "#dirsview"}
 
     def focus_active_table(self):
         """Move focus from the command line to the list of the active tab."""
@@ -745,6 +1014,37 @@ class MusicTUI(App):
             self.download_row()
         elif active == "queue":
             self.remove_row()
+        elif active == "library":
+            self.delete_library_row()
+        elif active == "folders":
+            self.remove_folder_row()
+
+    def delete_library_row(self):
+        """d on the Library tab: delete a managed-folder file from disk.
+        First press asks, second press within 5 s confirms; files that live
+        in extra folders are never deleted from here."""
+        path = self.library_cursor_path()
+        if path is None:
+            return
+        if not is_managed(path):
+            self.notify(f"'{path.name}' is in an extra folder — only files in the "
+                        "default library can be deleted", severity="warning")
+            return
+        now = time.monotonic()
+        if self._pending_delete == path and now - self._pending_delete_at < 5:
+            try:
+                path.unlink()
+            except OSError as exc:
+                self.notify(f"could not delete {path.name}: {exc}", severity="error")
+                return
+            self._pending_delete = None
+            self.notify(f"deleted from disk: {path.name}")
+            self.refresh_library()
+            self.refresh_folders()
+        else:
+            self._pending_delete = path
+            self._pending_delete_at = now
+            self.notify(f"press d again to delete '{path.name}' from disk", severity="warning")
 
     def action_enter_action(self):
         """Enter with no list focused: act on the highlighted row anyway."""
@@ -753,6 +1053,8 @@ class MusicTUI(App):
             self.action_add()
         elif active == "search":
             self.download_row()
+        elif active == "folders":
+            self.toggle_recursive_row()
 
     def remove_row(self):
         """Remove the highlighted track from the queue (d on the Queue tab)."""
@@ -770,9 +1072,15 @@ class MusicTUI(App):
 
     def action_add(self):
         """Add the highlighted library track to the queue (once)."""
-        if self.query_one(TabbedContent).active != "library" or not self.shown_library:
+        if self.query_one(TabbedContent).active != "library":
             return
-        path = self.shown_library[self.query_one("#libraryview", DataTable).cursor_row]
+        row = self.library_cursor_row()
+        if row is None:
+            return
+        if row[0] == "dir":  # a folder row: collapse/expand instead
+            self.toggle_collapse_row()
+            return
+        path = row[3]
         self._ensure_player()
         st = request("status") or {}
         if path.stem in st.get("queue", []):
@@ -784,18 +1092,31 @@ class MusicTUI(App):
             self.notify(f"queued: {path.stem}")
 
     def action_refresh(self):
-        if self.query_one(TabbedContent).active == "library":
+        active = self.query_one(TabbedContent).active
+        if active == "library":
             self.refresh_library()
+            self.refresh_folders()
+        elif active == "folders":
+            self.refresh_library()
+            self.refresh_folders()
 
     def action_cursor_down(self):
         table = self.active_table()
-        if table:
-            table.action_cursor_down()
+        if not table:
+            return
+        before = table.cursor_row
+        table.action_cursor_down()
+        if table.cursor_row != before and table.id == "libraryview":
+            self._auto_dir_nav(expand=True)   # moving down onto a folder opens it
 
     def action_cursor_up(self):
         table = self.active_table()
-        if table:
-            table.action_cursor_up()
+        if not table:
+            return
+        before = table.cursor_row
+        table.action_cursor_up()
+        if table.cursor_row != before and table.id == "libraryview":
+            self._auto_dir_nav(expand=False)  # moving up onto a folder closes it
 
     def action_cursor_top(self):
         table = self.active_table()
