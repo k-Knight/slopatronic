@@ -4,3 +4,4 @@ rapidfuzz
 yt-dlp
 imageio-ffmpeg
 miniaudio
+questionary

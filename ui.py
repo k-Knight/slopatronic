@@ -39,7 +39,7 @@ from pathlib import Path
 
 from .client import ensure_daemon, request
 from .config import BAR_CHARS, LIBRARY
-from .downloader import download, search
+from .downloader import SOURCE_ORDER, SEARCH_SOURCES, download, search
 from .folders import add_folder, folders, is_managed, remove_folder, set_recursive
 from .library import dir_file_counts, fuzzy_paths, library_files, library_tree
 
@@ -50,6 +50,7 @@ VOLUME_STEP = 0.05
 POLL_SECONDS = 0.05   # 20 status polls/s for smoother meter animation
 IDLE_POLL_SECONDS = 0.25  # slow poll when idle — no wasted IPC
 OFFLINE_POLL_SECONDS = 1.0  # when the daemon is dead, stop hammering the port
+RESULTS_PER_SOURCE = 8  # search rows fetched per source (grouped in the tab)
 STATUS_TIMEOUT = 0.3   # quick-fail status socket timeout — must not block the UI
 METER_DECAY = 0.75    # per-tick decay: bars fall gradually, hides stream-ahead lag
 METER_DELAY_SECONDS = 1.0  # hold the meter back so it never runs ahead of the audio
@@ -265,7 +266,8 @@ class MusicTUI(App):
 
     def __init__(self):
         super().__init__()
-        self.search_results = []       # every result of the last find
+        self.search_results = []       # every result of the last find (all sources)
+        self._results_lock = threading.Lock()  # search threads append under it
         self.shown_results = []        # results visible after filtering
         self.library_paths = []        # every library track
         self.shown_library_rows = []   # tree rows visible after filtering
@@ -284,6 +286,8 @@ class MusicTUI(App):
         self.shown_queue = []          # visible queue rows as (original index, name)
         self._last_queue_key = None    # skips rebuilds that would reset the cursor
         self._last_status = None       # last daemon status, for live queue filtering
+        self._np = {}                  # cached status widgets — no query_one per poll
+        self._np_last = {}             # last content per widget — skip redundant repaints
 
     # ----- layout -------------------------------------------------------
 
@@ -320,8 +324,14 @@ class MusicTUI(App):
         yield Input(placeholder=": command   / filter", id="command")
 
     def on_mount(self):
+        # cache the status widgets once: refresh_status runs up to 20x/s and
+        # must not walk the DOM (query_one) on every tick
+        self._np = {wid: self.query_one(f"#{wid}", Static)
+                    for wid in ("np_status", "np_title", "np_bar", "np_time",
+                                "np_meter", "np_vol", "statusline")}
+        self._np_btn_pause = self.query_one("#btn-pause", Button)
         results = self.query_one("#results", DataTable)
-        results.add_columns("Title")
+        results.add_columns("Source", "Title")
         queue = self.query_one("#queueview", DataTable)
         queue.add_columns("", "#", "Track")
         library = self.query_one("#libraryview", DataTable)
@@ -402,6 +412,15 @@ class MusicTUI(App):
             shown = self._meter_queue[0][1]
         return shown
 
+    def _np_update(self, wid, content):
+        """Update a status widget only when its content actually changed.
+        Each .update() dirties the DOM and forces a repaint even when the
+        text is identical — skipping identical updates is what keeps mouse
+        scrolling smooth while the 20 Hz poller runs."""
+        if self._np_last.get(wid) != content:
+            self._np_last[wid] = content
+            self._np[wid].update(content)
+
     def refresh_status(self):
         # a dead daemon must never block the UI thread: quick-fail timeout.
         # The request is ALWAYS issued — the poll interval (1 s offline) is
@@ -421,53 +440,59 @@ class MusicTUI(App):
             self._poll.interval = (POLL_SECONDS if st.get("active")
                                    else IDLE_POLL_SECONDS)
         active = bool(st and st.get("active"))
-        bar = self.query_one("#np_bar", Static)
         self._last_status = st
 
         if st is None:
-            self.query_one("#np_status", Static).update(
+            self._np_update("np_status",
                 f"[red]{ICON_OFFLINE} offline[/] — the daemon starts on the first add/play command")
-            self.query_one("#np_title", Static).update("[dim]nothing playing[/]")
-            self.query_one("#np_time", Static).update("")
-            self.query_one("#np_meter", Static).update("")
-            self.query_one("#np_vol", Static).update("")
-            bar.update(progress_bar(0, 0))
-            self.query_one("#statusline", Static).update("[red]offline[/]")
+            self._np_update("np_title", "[dim]nothing playing[/]")
+            self._np_update("np_time", "")
+            self._np_update("np_meter", "")
+            self._np_update("np_vol", "")
+            self._np_update("np_bar", progress_bar(0, 0))
+            self._np_update("statusline", "[red]offline[/]")
             return
 
         if not st.get("active"):
-            self.query_one("#np_status", Static).update(
+            self._np_update("np_status",
                 f"[dim]{ICON_IDLE} idle — press : and run find <query>[/]")
-            self.query_one("#np_title", Static).update("[dim]nothing playing[/]")
-            self.query_one("#np_time", Static).update("")
-            self.query_one("#np_meter", Static).update("")
-            self.query_one("#np_vol", Static).update(self.vol_bar(st.get("volume", 1.0)))
-            bar.update(progress_bar(0, 0))
-            self.query_one("#statusline", Static).update("idle")
+            self._np_update("np_title", "[dim]nothing playing[/]")
+            self._np_update("np_time", "")
+            self._np_update("np_meter", "")
+            self._np_update("np_vol", self.vol_bar(st.get("volume", 1.0)))
+            self._np_update("np_bar", progress_bar(0, 0))
+            self._np_update("statusline", "idle")
         else:
-            name = st["queue"][st["index"]]
+            # a stale index (e.g. removing the playing track against an older
+            # daemon) must never crash the whole TUI
+            if 0 <= st["index"] < len(st["queue"]):
+                name = st["queue"][st["index"]]
+                track_no = f"track {st['index'] + 1}/{len(st['queue'])}"
+                queue_pos = f"queue {st['index'] + 1}/{len(st['queue'])}"
+            else:
+                name, track_no, queue_pos = "unknown track", "", "queue"
             elapsed, total = st["elapsed"], st["duration"] or 1
             state = (f"[bold yellow]{ICON_PAUSE} paused[/]" if st["paused"]
                      else f"[bold green]{ICON_PLAY} playing[/]")
-            self.query_one("#np_status", Static).update(state)
-            self.query_one("#np_title", Static).update(name)
-            bar.update(progress_bar(elapsed, total))
-            self.query_one("#np_time", Static).update(
-                f"{fmt_time(elapsed)} / {fmt_time(total)}   ·   track "
-                f"{st['index'] + 1}/{len(st['queue'])}")
-            self.query_one("#np_meter", Static).update(
+            self._np_update("np_status", state)
+            self._np_update("np_title", name)
+            self._np_update("np_bar", progress_bar(elapsed, total))
+            self._np_update("np_time",
+                f"{fmt_time(elapsed)} / {fmt_time(total)}   ·   {track_no}")
+            self._np_update("np_meter",
                 meter_rows(self.smooth_meter(self.delayed_meter(st["meter"]))))
-            self.query_one("#np_vol", Static).update(self.vol_bar(st["volume"]))
-            self.query_one("#statusline", Static).update(
-                f"queue {st['index'] + 1}/{len(st['queue'])} · "
+            self._np_update("np_vol", self.vol_bar(st["volume"]))
+            self._np_update("statusline",
+                f"{queue_pos} · "
                 + ("paused" if st["paused"] else "playing"))
 
         if self.query_one(TabbedContent).active == "queue":
             self.render_queue(st, self.filter_query())
         # the pause button mirrors the state: show what pressing it will do
-        self.query_one("#btn-pause", Button).label = (
-            f"{ICON_PLAY} resume" if st and st.get("active") and st.get("paused")
-            else f"{ICON_PAUSE} pause")
+        label = (f"{ICON_PLAY} resume" if st and st.get("active") and st.get("paused")
+                 else f"{ICON_PAUSE} pause")
+        if self._np_btn_pause.label != label:
+            self._np_btn_pause.label = label
 
     @staticmethod
     def vol_bar(volume):
@@ -482,7 +507,10 @@ class MusicTUI(App):
         rows = [(i, name) for i, name in enumerate(st["queue"] if st else [])
                 if query in name.lower()]
         self.shown_queue = rows
-        key = (tuple(rows), bool(st and st.get("active")))
+        # the playing index must be part of the key: when the song changes
+        # only the ▶ marker moves, so titles alone would compare equal and
+        # skip the refresh
+        key = (tuple(rows), st["index"] if st and st.get("active") else None)
         if key == self._last_queue_key:
             return
         self._last_queue_key = key
@@ -673,13 +701,19 @@ class MusicTUI(App):
         return None
 
     def render_results(self, query=""):
+        """Render search results grouped by source (YouTube first, then the
+        rest in SEARCH_SOURCES order)."""
         table = self.query_one("#results", DataTable)
         table.clear()
         needle = query.lower()
-        self.shown_results = [e for e in self.search_results
-                              if needle in e.get("title", "untitled").lower()]
-        for entry in self.shown_results:
-            table.add_row(entry.get("title", "untitled"))
+        entries = [e for e in self.search_results
+                   if needle in e.get("title", "untitled").lower()]
+        entries.sort(key=lambda e: SOURCE_ORDER.index(e.get("_source", ""))
+                     if e.get("_source") in SOURCE_ORDER else len(SOURCE_ORDER))
+        self.shown_results = entries
+        for entry in entries:
+            table.add_row(entry.get("_source", ""),
+                          entry.get("title", "untitled"))
 
     @on(Input.Changed, "#command")
     def filter_changed(self, event: Input.Changed):
@@ -707,20 +741,29 @@ class MusicTUI(App):
     # ----- search / download ---------------------------------------------
 
     def run_search(self, query):
-        """Search YouTube in the background and fill the Search tab."""
+        """Search every source in parallel; each thread appends its results
+        and re-renders, so rows appear grouped by source as they arrive."""
+        with self._results_lock:
+            self.search_results = []
+        self.render_results(self.filter_query())  # drop stale rows at once
 
-        def work():
+        def work(source, fn):
             try:
-                results = search(query)
+                entries = fn(query, RESULTS_PER_SOURCE)
             except Exception as exc:
-                self.call_from_thread(self.notify, f"search failed: {exc}", severity="error")
+                self.call_from_thread(self.notify,
+                                      f"{source} search failed: {exc}", severity="error")
                 return
-            self.search_results = results
+            for entry in entries:
+                entry["_source"] = source
+            with self._results_lock:
+                self.search_results.extend(entries)
             self.call_from_thread(self.render_results, self.filter_query())
             self.call_from_thread(self.notify,
-                                  f"{len(results)} results — j/k to move, d or Enter to download")
+                                  f"{source}: {len(entries)} results")
 
-        threading.Thread(target=work, daemon=True).start()
+        for source, fn in SEARCH_SOURCES:
+            threading.Thread(target=work, args=(source, fn), daemon=True).start()
 
     def download_row(self):
         if not self.shown_results:
@@ -769,7 +812,7 @@ class MusicTUI(App):
             if not args:
                 self.notify("usage: find <query>", severity="warning")
             else:
-                self.notify(f"searching YouTube for '{args}'…")
+                self.notify(f"searching YouTube, SoundCloud, Bandcamp, Mixcloud for '{args}'…")
                 self.run_search(args)
                 self.query_one(TabbedContent).active = "search"
         elif cmd == "add":

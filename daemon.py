@@ -41,7 +41,8 @@ class Daemon:
         return {
             "active": True,
             "queue": [p.stem for p in self.queue],
-            "index": self.index,
+            # clamp defensively: no client must ever see an out-of-range index
+            "index": min(self.index, len(self.queue) - 1),
             "paused": self.player.paused,
             "elapsed": self.player.elapsed(),
             "duration": self.player.duration(),
@@ -72,9 +73,13 @@ class Daemon:
                 if idx < self.index:
                     self.index -= 1
                 elif idx == self.index:
-                    if not self.queue:
+                    if not self.queue or idx == len(self.queue):
+                        # removed the playing track and nothing follows it
+                        # (queue drained, or it was the last element):
+                        # nothing more to play — stop and clear, exactly like
+                        # a natural end-of-queue
                         self._go_idle()
-                    elif self.player.loaded:
+                    else:
                         self._load_current()  # play the new occupant of the slot
                 elif self.index >= len(self.queue):
                     self.index = max(0, len(self.queue) - 1)

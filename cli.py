@@ -1,26 +1,47 @@
 import argparse
 import time
 
+import questionary
+
 
 from .client import ensure_daemon, request
-from .downloader import download, search
+from .downloader import download, search_all
 from .library import fuzzy_paths, library_files, library_tree
 from .ui import console, queue_table, run_ui
 
 
 def pick_youtube(query):
-    """Search YouTube and let the user tick results. Returns the chosen entries."""
-    with console.status(f"Searching YouTube for '{query}'..."):
-        results = search(query)
-    if not results:
+    """Search every source (shared search_all), print results grouped by
+    source with per-source failure reasons, then let the user tick tracks
+    to download (the original checkbox picker)."""
+    flat = []  # (source label, entry) across all sources, for the picker
+    for source, entries, error in search_all(query):
+        if error:
+            console.print(f"[red]{source}: search failed — "
+                          f"{type(error).__name__}: {error}[/]")
+            continue
+        console.print(f"[green]{source}: {len(entries)} results:[/]")
+        for i, entry in enumerate(entries, 1):
+            title = entry.get("title", "untitled")
+            url = entry.get("url") or entry.get("id") or ""
+            console.print(f"  {i:2d}. {title}  [dim]{url}[/]")
+            flat.append((source, entry))
+    if not flat:
         console.print("[red]No results.[/]")
         return []
-    # the TUI is the picker; run it and let the user download from the Search tab
-    console.print(f"[green]{len(results)} results:[/]")
-    for i, entry in enumerate(results, 1):
-        console.print(f"  {i:2d}. {entry.get('title', 'untitled')}")
-    console.print("[dim]Tip: run `ui` and use `find` there to download inside the TUI.[/]")
-    return []
+    picked = questionary.checkbox(
+        "Tick tracks with space, then Enter to download:",
+        choices=[questionary.Choice(f"[{source}] {e.get('title', 'untitled')}",
+                                    value=e)
+                 for source, e in flat],
+        use_search_filter=True,
+        use_jk_keys=False,
+    ).ask()
+    if picked is None:
+        return []
+    if not picked:
+        console.print("[dim]Nothing ticked. Press space on a track to tick it, then Enter.[/]")
+    return picked
 
 
 def fetch(entry):
