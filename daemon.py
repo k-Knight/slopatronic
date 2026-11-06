@@ -4,7 +4,8 @@ import threading
 import time
 from pathlib import Path
 
-from .config import HOST, PORT
+from .config import HOST, PORT, correction_enabled, load_volume, save_volume
+from .loudness import gain_multiplier, measure_gain
 from .player import Player
 
 
@@ -16,16 +17,45 @@ class Daemon:
         self.queue = []
         self.index = 0
         self.player = Player()
+        # the knob; per-track normalization gain is separate
+        self.user_volume = load_volume()
+        self.player.set_volume(self.user_volume)
+        # in-memory loudness gains (dB) per queued track path, measured when
+        # a track is queued; never written to disk, gone when the daemon stops
+        self.gains = {}
         self.server = None
         self.stopping = threading.Event()
 
+    def _measure_async(self, paths):
+        """Measure queued tracks in the background and cache the gain in
+        memory; if one of them is already playing, apply it as soon as known.
+        Skipped entirely when the loudness_correction toggle is off."""
+        if not correction_enabled():
+            return
+
+        def work():
+            for path in paths:
+                gain = measure_gain(path)
+                with self.lock:
+                    self.gains[str(path)] = gain or 0.0
+                    if (self.player.loaded and self.index < len(self.queue)
+                            and str(self.queue[self.index]) == str(path)):
+                        self.player.set_gain(gain_multiplier(gain))
+        threading.Thread(target=work, daemon=True).start()
+
     def _load_current(self):
         self.player.load(self.queue[self.index])
+        # passive volume normalization: the in-memory gain measured at queue
+        # time, applied on top of the user's volume knob; neutral unless the
+        # loudness_correction toggle is on and a measured gain exists
+        gain = self.gains.get(str(self.queue[self.index]), 0.0) if correction_enabled() else 0.0
+        self.player.set_gain(gain_multiplier(gain))
 
     def _go_idle(self):
         self.player.stop()
         self.queue = []
         self.index = 0
+        self.gains.clear()
 
     def _advance(self):
         if self.index + 1 < len(self.queue):
@@ -47,7 +77,7 @@ class Daemon:
             "elapsed": self.player.elapsed(),
             "duration": self.player.duration(),
             "meter": self.player.meter(),
-            "volume": self.player.volume,
+            "volume": self.user_volume,
         }
 
     def handle(self, req):
@@ -63,13 +93,15 @@ class Daemon:
                     self._load_current()
                 else:
                     self.queue.extend(paths)
+                self._measure_async(paths)
             elif cmd == "remove":
                 # drop one queued track; removing the currently playing one
                 # skips straight to the track that takes its slot
                 idx = int(req["index"])
                 if not (0 <= idx < len(self.queue)):
                     return {"error": "no such queue index"}
-                self.queue.pop(idx)
+                popped = self.queue.pop(idx)
+                self.gains.pop(str(popped), None)
                 if idx < self.index:
                     self.index -= 1
                 elif idx == self.index:
@@ -92,6 +124,7 @@ class Daemon:
                     self.queue = [path]
                     self.index = 0
                 self._load_current()
+                self._measure_async([path])
             elif cmd == "pause" and self.player.loaded:
                 self.player.toggle_pause()
             elif cmd == "next" and self.player.loaded:
@@ -102,7 +135,9 @@ class Daemon:
             elif cmd == "seek" and self.player.loaded:
                 self.player.seek(float(req["seconds"]))
             elif cmd == "volume":
-                self.player.set_volume(self.player.volume + float(req["delta"]))
+                self.user_volume = min(1.0, max(0.0, self.user_volume + float(req["delta"])))
+                self.player.set_volume(self.user_volume)
+                save_volume(self.user_volume)  # remembered for the next start
             elif cmd == "stop":
                 self._go_idle()
                 self.stopping.set()

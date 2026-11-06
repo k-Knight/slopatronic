@@ -1,10 +1,11 @@
 """Folders the library reads from.
 
 The default (managed) folder is always included and always scanned
-recursively. Extra folders live in folders.json inside the library (base)
-folder — the config itself is stored in the base folder:
+recursively. Extra folders and the remembered player volume live in the
+single config.json inside ~/.slopatronic — always generated on first use:
 
-    [{"path": "/abs/dir", "recursive": false}, ...]
+    {"folders": [{"path": "/abs/dir", "recursive": false}, ...],
+     "volume": 1.0}
 
 `recursive` (default false) makes the scan descend into subdirectories.
 The Library tree's collapse/expand state is per-session, never saved.
@@ -12,31 +13,26 @@ Removing an extra folder only unregisters it — files on disk are never
 touched.
 """
 
-import json
 from pathlib import Path
 
-from .config import DIRS_FILE, LIBRARY
+from .config import LIBRARY, load_config, save_config
 
 
 def load_entries():
     """Extra folder entries as [{"path", "recursive"}, ...]."""
-    if not DIRS_FILE.exists():
-        return []
-    try:
-        data = json.loads(DIRS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    entries = []
-    for entry in data:
+    entries = load_config().get("folders", [])
+    out = []
+    for entry in entries:
         if isinstance(entry, dict) and entry.get("path"):
-            entries.append({"path": str(entry["path"]),
-                            "recursive": bool(entry.get("recursive", False))})
-    return entries
+            out.append({"path": str(entry["path"]),
+                        "recursive": bool(entry.get("recursive", False))})
+    return out
 
 
 def save_entries(entries):
-    LIBRARY.mkdir(parents=True, exist_ok=True)
-    DIRS_FILE.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    data = load_config()
+    data["folders"] = entries
+    save_config(data)
 
 
 def _norm(path):
@@ -92,15 +88,6 @@ def set_recursive(path, value):
     for entry in entries:
         if _norm(entry["path"]) == folder:
             entry["recursive"] = value
-            save_entries(entries)
-            return value
-    raise KeyError(f"not a registered extra folder: {folder}")
-    folder = _norm(path)
-    value = bool(value)
-    entries = load_entries()
-    for entry in entries:
-        if _norm(entry["path"]) == folder:
-            entry[flag] = value
             save_entries(entries)
             return value
     raise KeyError(f"not a registered extra folder: {folder}")

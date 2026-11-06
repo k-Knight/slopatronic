@@ -38,6 +38,7 @@ class Player:
         self.paused = False
         self.loaded = False
         self.volume = 1.0
+        self.gain = 1.0  # per-track loudness normalization multiplier
         self._running = False
 
     def _stream(self):
@@ -47,12 +48,19 @@ class Player:
             chunk = self.samples[self.pos:self.pos + count]
             self.pos += len(chunk)
             chunk.extend(array("h", [0]) * (count - len(chunk)))
-            if self.volume < 1.0:
-                chunk = array("h", [int(s * self.volume) for s in chunk])
+            vol = self.volume * self.gain
+            if vol != 1.0:
+                # clamp per sample: a normalization boost must not overflow int16
+                chunk = array("h", [max(-32768, min(32767, int(s * vol)))
+                                    for s in chunk])
             needed = yield chunk
 
     def set_volume(self, volume):
         self.volume = round(min(1.0, max(0.0, volume)), 2)
+
+    def set_gain(self, multiplier):
+        """Per-track loudness normalization multiplier (0.18..~2.0 = ±15 dB)."""
+        self.gain = round(min(10.0 ** (15.0 / 20.0), max(0.1, multiplier)), 3)
 
     def _start(self):
         stream = self._stream()
