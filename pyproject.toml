@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slopatronic"
+version = "0.1.0"
+description = "Find music on YouTube (audio only), keep a library, and play it in the background."
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.60",
+    "rich>=13.0",
+    "rapidfuzz",
+    "yt-dlp",
+    "imageio-ffmpeg",
+    "miniaudio",
+    "questionary",
+]
+
+[project.scripts]
+slopatronic = "slopatronic.cli:main"
+
+[tool.setuptools]
+packages = ["slopatronic"]
+
+[tool.setuptools.package-dir]
+slopatronic = "."
